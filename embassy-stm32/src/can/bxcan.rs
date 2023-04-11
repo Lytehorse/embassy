@@ -219,7 +219,7 @@ impl<'d, T: Instance> Can<'d, T> {
 
         match state.rx_queue.enqueue(frame) {
             Ok(_) => {}
-            Err(_) => defmt::error!("RX queue overflow"),
+            Err(_) => {},
         }
         state.rx_waker.wake();
     }
