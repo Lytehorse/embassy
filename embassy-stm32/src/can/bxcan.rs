@@ -5,6 +5,7 @@ use core::task::Poll;
 pub use bxcan;
 use bxcan::{Data, ExtendedId, Frame, Id, StandardId};
 use embassy_hal_common::{into_ref, PeripheralRef};
+use stm32_metapac::can::vals::{Errie, Slkie, Wkuie};
 
 use crate::gpio::sealed::AFType;
 use crate::interrupt::InterruptExt;
@@ -18,6 +19,7 @@ pub struct Can<'d, T: Instance> {
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum BusError {
     Stuff,
     Form,
@@ -31,8 +33,10 @@ pub enum BusError {
     BusWarning,
 }
 
-pub enum FrameOrError {
+pub enum CanEvent {
     Frame(Frame),
+    Sleep,
+    Wakeup,
     Error(BusError),
 }
 
@@ -104,9 +108,8 @@ impl<'d, T: Instance> Can<'d, T> {
         self.can.modify_config().set_bit_timing(bit_timing).leave_disabled();
     }
 
-    pub async fn transmit(&mut self, frame: &Frame) {
-        let tx_status = self.queue_transmit(frame).await;
-        self.wait_transission(tx_status.mailbox()).await;
+    pub async fn transmit(&mut self, frame: &Frame) -> bxcan::TransmitStatus {
+        self.queue_transmit(frame).await
     }
 
     async fn queue_transmit(&mut self, frame: &Frame) -> bxcan::TransmitStatus {
@@ -120,23 +123,16 @@ impl<'d, T: Instance> Can<'d, T> {
         .await
     }
 
-    async fn wait_transission(&self, mb: bxcan::Mailbox) {
-        poll_fn(|cx| unsafe {
-            if T::regs().tsr().read().tme(mb.index()) {
-                return Poll::Ready(());
-            }
-            T::state().tx_waker.register(cx.waker());
-            Poll::Pending
-        })
-        .await;
-    }
-
-    pub async fn receive_frame_or_error(&mut self) -> FrameOrError {
+    pub async fn receive_event(&mut self) -> CanEvent {
         poll_fn(|cx| {
             if let Some(frame) = T::state().rx_queue.dequeue() {
-                return Poll::Ready(FrameOrError::Frame(frame));
+                return Poll::Ready(CanEvent::Frame(frame));
             } else if let Some(err) = self.curr_error() {
-                return Poll::Ready(FrameOrError::Error(err));
+                return Poll::Ready(CanEvent::Error(err));
+            } else if self.check_sleep() {
+                return Poll::Ready(CanEvent::Sleep);
+            } else if self.check_wake() {
+                return Poll::Ready(CanEvent::Wakeup);
             }
             T::state().rx_waker.register(cx.waker());
             T::state().err_waker.register(cx.waker());
@@ -145,7 +141,37 @@ impl<'d, T: Instance> Can<'d, T> {
         .await
     }
 
+    pub fn flush_pending_tx_and_sleep(&mut self) {
+        self.can.abort(bxcan::Mailbox::Mailbox0);
+        self.can.abort(bxcan::Mailbox::Mailbox1);
+        self.can.abort(bxcan::Mailbox::Mailbox2);
+
+        unsafe {
+            T::regs().ier().modify(|v| v.set_errie(Errie::DISABLED));
+        }
+        self.can.sleep();
+    }
+
+    pub fn is_in_sleep(&mut self) -> bool {
+        unsafe { T::regs().msr().read().slak() }
+    }
+
+    pub fn is_err_passive(&mut self) -> bool {
+        unsafe { T::regs().esr().read().epvf() }
+    }
+
     fn curr_error(&self) -> Option<BusError> {
+        let err_set = unsafe { T::regs().msr().read().erri() };
+        // If the ERRI flag has already been acknowledged, the error has
+        // already been received. No need to return it until it's set again.
+        if !err_set {
+            return None;
+        }
+        // Acknowledge the error and re-enable the interrupt
+        unsafe {
+            T::regs().msr().modify(|v| v.set_erri(true));
+            T::regs().ier().modify(|v| v.set_errie(Errie::ENABLED));
+        }
         let err = unsafe { T::regs().esr().read() };
         if err.boff() {
             return Some(BusError::BusOff);
@@ -159,22 +185,61 @@ impl<'d, T: Instance> Can<'d, T> {
         None
     }
 
+    fn check_sleep(&mut self) -> bool {
+        let regs = T::regs();
+        let msr = regs.msr();
+        let msr_val = unsafe { msr.read() };
+        if msr_val.slaki() {
+            unsafe {
+                msr.modify(|v| v.set_slaki(true));
+                regs.ier().modify(|v| v.set_slkie(Slkie::ENABLED));
+            }
+            return true;
+        }
+        false
+    }
+
+    fn check_wake(&mut self) -> bool {
+        let regs = T::regs();
+        let msr = regs.msr();
+        let msr_val = unsafe { msr.read() };
+        if msr_val.wkui() {
+            unsafe {
+                msr.modify(|v| v.set_wkui(true));
+                regs.mcr().modify(|v| v.set_sleep(false));
+                regs.ier().modify(|v| v.set_wkuie(Wkuie::ENABLED));
+            }
+            return true;
+        }
+        false
+    }
+
     unsafe fn sce_interrupt(_: *mut ()) {
         let msr = T::regs().msr();
+        let ier = T::regs().ier();
         let msr_val = msr.read();
 
-        if msr_val.erri() {
-            msr.modify(|v| v.set_erri(true));
+        // Disable the interrupt so that listener can acknowledge the
+        // error and re-enable the ISR.
+        if msr_val.slaki() {
+            ier.modify(|v| v.set_slkie(Slkie::DISABLED));
+        } else if msr_val.erri() {
+            T::regs().ier().modify(|v| v.set_errie(Errie::DISABLED));
             T::state().err_waker.wake();
-            return;
+        } else if msr_val.wkui() {
+            ier.modify(|v| v.set_wkuie(Wkuie::DISABLED));
         }
     }
 
     unsafe fn tx_interrupt(_: *mut ()) {
-        T::regs().tsr().write(|v| {
-            v.set_rqcp(0, true);
-            v.set_rqcp(1, true);
-            v.set_rqcp(2, true);
+        let reg = T::regs().tsr();
+        let val = reg.read();
+        reg.write(|v| {
+            for i in 0..3 {
+                if val.rqcp(i) {
+                    v.set_rqcp(i, true);
+                }
+            }
         });
         T::state().tx_waker.wake();
     }
@@ -219,7 +284,7 @@ impl<'d, T: Instance> Can<'d, T> {
 
         match state.rx_queue.enqueue(frame) {
             Ok(_) => {}
-            Err(_) => {},
+            Err(_) => {}
         }
         state.rx_waker.wake();
     }
